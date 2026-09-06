@@ -1,0 +1,19 @@
+ 
+ -------------- celery@LAPTOP-PNG4K0OB v5.6.3 (recovery)
+--- ***** ----- 
+-- ******* ---- Windows-11-10.0.26200-SP0 2026-09-04 01:12:15
+- *** --- * --- 
+- ** ---------- [config]
+- ** ---------- .> app:         vastrai:0x19148dad7f0
+- ** ---------- .> transport:   redis://localhost:6380/0
+- ** ---------- .> results:     redis://localhost:6380/1
+- *** --- * --- .> concurrency: 12 (solo)
+-- ******* ---- .> task events: OFF (enable -E to monitor tasks in this worker)
+--- ***** ----- 
+ -------------- [queues]
+                .> vastrai.tryon    exchange=vastrai.tryon(direct) key=vastrai.tryon
+                
+
+[tasks]
+  . app.worker.tasks.process_try_on_job
+

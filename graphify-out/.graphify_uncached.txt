@@ -1,0 +1,15 @@
+D:\project\VastraView\AI_MODEL.md
+D:\project\VastraView\API.md
+D:\project\VastraView\ARCHITECTURE.md
+D:\project\VastraView\ENGINEERING_PROGRESS.md
+D:\project\VastraView\README.md
+D:\project\VastraView\TESTING.md
+D:\project\VastraView\backend\docker-compose.yml
+D:\project\VastraView\backend\requirements.txt
+D:\project\VastraView\mobile\AGENTS.md
+D:\project\VastraView\mobile\CLAUDE.md
+D:\project\VastraView\mobile\assets\adaptive-icon.png
+D:\project\VastraView\mobile\assets\favicon.png
+D:\project\VastraView\mobile\assets\icon.png
+D:\project\VastraView\mobile\assets\logo.png
+D:\project\VastraView\mobile\assets\splash-icon.png
