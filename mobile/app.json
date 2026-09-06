@@ -1,0 +1,42 @@
+{
+  "expo": {
+    "name": "VastrAI",
+    "slug": "vastrai",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/logo.png",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "scheme": "vastrai",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0D0B1A"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.vastrai.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "VastrAI uses the camera to capture your photo and your cloth/fabric for virtual try-on."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0D0B1A"
+      },
+      "edgeToEdgeEnabled": true,
+      "predictiveBackGestureEnabled": false,
+      "package": "com.vastrai.app",
+      "permissions": ["android.permission.CAMERA"]
+    },
+    "web": { "favicon": "./assets/logo.png" },
+    "plugins": [
+      "expo-router",
+      "expo-font",
+      ["expo-image-picker", { "photosPermission": "VastrAI uses your photos to create virtual try-on previews." }],
+      ["expo-camera", { "cameraPermission": "Allow VastrAI to access the camera to capture your photo and cloth." }],
+      ["expo-media-library", { "photosPermission": "VastrAI needs access to save your generated looks to your gallery." }]
+    ]
+  }
+}
