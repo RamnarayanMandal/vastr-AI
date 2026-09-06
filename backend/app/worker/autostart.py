@@ -164,17 +164,30 @@ def ensure_worker_running() -> bool:
         )
 
     try:
+        proc_log = subprocess.DEVNULL
+        log_dir = backend_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        proc_log = open(log_dir / "worker.log", "ab")  # noqa: SIM115
+    except Exception:  # noqa: BLE001 - never block worker boot on a log file
+        proc_log = subprocess.DEVNULL
+
+    try:
         proc = subprocess.Popen(
             celery_cmd,
             cwd=str(backend_dir),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=proc_log,
+            stderr=proc_log,
             stdin=subprocess.DEVNULL,
             creationflags=creationflags,
             close_fds=True,
         )
     except Exception as exc:  # noqa: BLE001
         print(f"[AUTOSTART] Failed to spawn Celery worker: {exc}")
+        if proc_log is not subprocess.DEVNULL:
+            try:
+                proc_log.close()
+            except Exception:  # noqa: BLE001
+                pass
         return False
 
     _write_lock(str(proc.pid), " ".join(celery_cmd))

@@ -1,6 +1,6 @@
 import uuid
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from unittest.mock import MagicMock, patch
@@ -9,7 +9,14 @@ from app.models import MediaAsset, TryOnJob, TryOnResult
 from app.services.pipeline import synthesize_fabric_bytes, synthesize_person_bytes
 from app.services.try_on_provider import CatVTONProvider, MockVirtualTryOnProvider
 from app.worker import tasks
-from app.worker.tasks import _backoff, _claim_job, _fail, _process_job
+from app.worker.tasks import (
+    _backoff,
+    _claim_job,
+    _fail,
+    _process_job,
+    _reset_to_queued,
+    recover_stale_jobs,
+)
 from app.main import lifespan
 
 
@@ -183,6 +190,50 @@ def test_fail_writes_message(db_session, sample_user):
     assert job.error_message == "custom message"
 
 
+def test_recover_stale_jobs_fails_old_queued(db_session, sample_user):
+    assets = _seed_assets(db_session, sample_user.id)
+    job = _seed_job(db_session, sample_user.id, assets)
+    job.created_at = datetime.utcnow() - timedelta(
+        seconds=tasks.settings.try_on_stale_queue_ttl + 60
+    )
+    db_session.commit()
+
+    assert recover_stale_jobs(db_session) >= 1
+    db_session.refresh(job)
+    assert job.status == "FAILED"
+    assert "took too long" in (job.error_message or "")
+
+
+def test_recover_stale_jobs_fails_old_processing(db_session, sample_user):
+    assets = _seed_assets(db_session, sample_user.id)
+    job = _seed_job(db_session, sample_user.id, assets)
+    job.status = "PROCESSING"
+    job.created_at = datetime.utcnow() - timedelta(hours=2)
+    job.started_at = datetime.utcnow() - timedelta(
+        seconds=tasks.settings.try_on_stale_processing_ttl + 60
+    )
+    db_session.commit()
+
+    assert recover_stale_jobs(db_session) >= 1
+    db_session.refresh(job)
+    assert job.status == "FAILED"
+
+
+def test_recover_stale_jobs_keeps_recent_jobs(db_session, sample_user):
+    assets = _seed_assets(db_session, sample_user.id)
+    queued_recent = _seed_job(db_session, sample_user.id, assets)
+    job = _seed_job(db_session, sample_user.id, assets)
+    job.status = "PROCESSING"
+    job.started_at = datetime.utcnow()
+    db_session.commit()
+
+    assert recover_stale_jobs(db_session) == 0
+    db_session.refresh(queued_recent)
+    assert queued_recent.status == "QUEUED"
+    db_session.refresh(job)
+    assert job.status == "PROCESSING"
+
+
 def test_process_job_langgraph_engine_persists_result(db_session, sample_user):
     """AI_WORKFLOW_ENGINE=langgraph: the worker runs the graph, the saver
     callback persists a valid TryOnResult + result asset, job -> COMPLETED."""
@@ -218,6 +269,70 @@ def test_process_job_langgraph_engine_persists_result(db_session, sample_user):
     result_row = (
         db_session.query(TryOnResult).filter(TryOnResult.try_on_job_id == job.id).first()
     )
+    assert result_row is not None
+    assert result_row.result_url == "https://ik.imagekit.io/vastrai/result-langgraph.jpg"
+
+
+def test_reset_to_queued_reopens_fresh_session(monkeypatch, db_session, sample_user):
+    """A dead worker session must not lose a Celery retry: _reset_to_queued
+    falls back to a fresh session and still resets the job to QUEUED."""
+    monkeypatch.setattr(tasks, "SessionLocal", lambda: db_session)
+
+    assets = _seed_assets(db_session, sample_user.id)
+    job = _seed_job(db_session, sample_user.id, assets)
+
+    broken = MagicMock()
+    broken.query.return_value.filter.return_value.update.side_effect = RuntimeError("SSL connection has been closed unexpectedly")
+
+    session = _reset_to_queued(broken, job.id)
+    assert session is db_session
+    db_session.refresh(job)
+    assert job.status == "QUEUED"
+    assert job.retry_count == 1
+
+
+def test_save_langgraph_result_recovers_with_fresh_session(monkeypatch, db_session, sample_user):
+    """When result persistence hits a dropped connection, _save_langgraph_result
+    re-runs the (idempotent) write on a fresh session instead of failing the job
+    or losing the already-generated image."""
+    monkeypatch.setattr(tasks, "SessionLocal", lambda: db_session)
+
+    real_write = tasks._write_langgraph_result
+    calls = {"n": 0}
+
+    def flaky_write(db, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("SSL connection has been closed unexpectedly")
+        return real_write(db, *args, **kwargs)
+
+    monkeypatch.setattr(tasks, "_write_langgraph_result", flaky_write)
+
+    def fake_run_workflow(**kwargs):
+        saver = kwargs["saver"]
+        state = {
+            "job_id": kwargs["job_id"],
+            "status": "COMPLETED",
+            "result_url": "https://ik.imagekit.io/vastrai/result-langgraph.jpg",
+        }
+        saver(state)
+        return state
+
+    with patch("app.worker.tasks.get_provider", return_value=MockVirtualTryOnProvider()):
+        with patch("app.services.workflow.run_workflow", side_effect=fake_run_workflow):
+            with patch("app.services.image_gen.get_image_gen_backend") as get_backend:
+                get_backend.return_value = object()
+                assets = _seed_assets(db_session, sample_user.id)
+                job = _seed_job(db_session, sample_user.id, assets)
+                job_id = job.id
+                with patch("app.worker.tasks.settings.workflow_engine", "langgraph"):
+                    result = _process_job(db_session, job.id)
+
+    assert calls["n"] == 2
+    assert result["status"] == "COMPLETED"
+    job_after = db_session.query(TryOnJob).filter(TryOnJob.id == job_id).one()
+    assert job_after.status == "COMPLETED"
+    result_row = db_session.query(TryOnResult).filter(TryOnResult.try_on_job_id == job_id).first()
     assert result_row is not None
     assert result_row.result_url == "https://ik.imagekit.io/vastrai/result-langgraph.jpg"
 

@@ -28,6 +28,7 @@ from typing import List, Optional
 import httpx
 
 from ..config import settings
+from ..services.perf import ago_ms, perf
 
 
 class ImageGenError(Exception):
@@ -524,14 +525,23 @@ class OpenRouterImageGenBackend(ImageGenBackend):
             )
         )
 
-    def _call_with_model(self, model: str, prompt: str, images: List[bytes]) -> bytes:
+    def _call_with_model(self, model: str, prompt: str, images: List[bytes], task: str = "") -> bytes:
+        enc_t = time.perf_counter()
+        references = [
+            {"type": "image_url", "image_url": {"url": self._data_url(img)}}
+            for img in images
+        ]
+        perf(
+            "ai_input_encode_end",
+            task=task,
+            model=model,
+            duration_ms=round(ago_ms(enc_t), 1),
+            input_images=len(images),
+        )
         payload = {
             "model": model,
             "prompt": prompt,
-            "input_references": [
-                {"type": "image_url", "image_url": {"url": self._data_url(img)}}
-                for img in images
-            ],
+            "input_references": references,
             "aspect_ratio": self.aspect_ratio,
             "num_images": self.num_images,
         }
@@ -549,6 +559,7 @@ class OpenRouterImageGenBackend(ImageGenBackend):
         resp = None
         last_error = None
         for attempt in range(1, self.max_retries + 1):
+            att_t = time.perf_counter()
             try:
                 resp = httpx.post(
                     url,
@@ -556,13 +567,26 @@ class OpenRouterImageGenBackend(ImageGenBackend):
                     headers=headers,
                     timeout=self.timeout,
                 )
+                http_err = ""
             except httpx.HTTPError as exc:
                 last_error = exc
                 resp = None
+                http_err = f"{type(exc).__name__}: {exc}"
+            perf(
+                "ai_http_attempt_end",
+                task=task,
+                model=model,
+                attempt=attempt,
+                duration_ms=round(ago_ms(att_t), 1),
+                status=resp.status_code if resp is not None else None,
+                error=http_err,
+            )
             if resp is not None and resp.status_code not in (429,) and resp.status_code < 500:
                 break
             if attempt < self.max_retries:
-                time.sleep(1.5 * (2 ** (attempt - 1)))
+                sleep_s = 1.5 * (2 ** (attempt - 1))
+                perf("ai_retry_backoff", task=task, model=model, attempt=attempt, sleep_s=sleep_s)
+                time.sleep(sleep_s)
         if resp is None:
             raise ImageGenAPIError(
                 f"OpenRouter request failed after {self.max_retries} attempts: {last_error}"
@@ -582,6 +606,7 @@ class OpenRouterImageGenBackend(ImageGenBackend):
         except ValueError:
             raise ImageGenAPIError("OpenRouter returned an unparseable response.")
 
+        dec_t = time.perf_counter()
         b64 = None
         for item in result.get("data", []) or []:
             if item.get("b64_json"):
@@ -597,6 +622,14 @@ class OpenRouterImageGenBackend(ImageGenBackend):
             raise ImageGenAPIError(f"OpenRouter returned invalid base64: {exc}")
         if not img:
             raise ImageGenAPIError("OpenRouter returned an empty image.")
+        perf(
+            "ai_response_decode_end",
+            task=task,
+            model=model,
+            duration_ms=round(ago_ms(dec_t), 1),
+            bytes=len(img),
+            output_images=1,
+        )
         usage = result.get("usage") or {}
         cost = usage.get("cost")
         if cost is not None:
@@ -622,8 +655,10 @@ class OpenRouterImageGenBackend(ImageGenBackend):
 
         last_error = None
         for index, model_name in enumerate(candidates):
+            if index > 0:
+                perf("ai_fallback_used", task=task, model=self.model, fallback=model_name)
             try:
-                return self._call_with_model(model_name, prompt, images)
+                return self._call_with_model(model_name, prompt, images, task=task)
             except ImageGenAPIError as exc:
                 last_error = exc
                 if index == 0 and self._should_fallback(exc):

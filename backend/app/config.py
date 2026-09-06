@@ -102,6 +102,12 @@ class Settings(BaseSettings):
     retry_backoff_base: int = 5             # seconds, 5 * 2**retries
     retry_max_delay: int = 60               # cap in seconds
 
+    # Stale-job recovery (seen on worker startup + before each claim). Guards
+    # against workers dying mid-flight or tasks never being delivered: a job
+    # stuck past these TTLs is marked FAILED instead of polling forever.
+    try_on_stale_queue_ttl: int = 900        # QUEUED watchdog, seconds (15m)
+    try_on_stale_processing_ttl: int = 1800  # PROCESSING watchdog, seconds (30m)
+
     # CORS
     cors_origins: str = "*"
 

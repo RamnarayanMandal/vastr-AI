@@ -137,7 +137,13 @@ def garment_prompts(garment_type: str, garment_style: str, analysis: Optional[di
     The text is supplementary only - the uploaded garment reference image is
     the authoritative source for garment appearance and is passed to the model
     through the provider's image-reference channel.
+
+    The selected garment type + style are hardened through
+    ``services.garment_spec`` (silhouette/construction constraints and the
+    rule that the style refines the garment and never replaces it).
     """
+    from . import garment_spec
+
     pal = []
     if analysis:
         pal.append(f"dominant color {analysis.get('dominant_hex', '')}")
@@ -154,10 +160,26 @@ def garment_prompts(garment_type: str, garment_style: str, analysis: Optional[di
             )
     fabric_desc = ", ".join(t for t in pal if t) or "a plain fabric"
     marker = "authoritative source for the garment appearance"
+    spec = (
+        f"{garment_spec.priority_rule(garment_type)} The product must be "
+        f"{garment_spec.garment_type_constraint(garment_type)} "
+        f"{garment_spec.garment_negative_constraint(garment_type, garment_style)} "
+        f"{garment_spec.style_constraint(garment_type, garment_style)} "
+    )
+    spec_tryon = (
+        f"{garment_spec.priority_rule(garment_type)} The garment worn must be "
+        f"{garment_spec.garment_type_constraint(garment_type)} "
+        f"{garment_spec.garment_negative_constraint(garment_type, garment_style)} "
+        f"{garment_spec.style_constraint(garment_type, garment_style)} "
+    )
+    name = (
+        f"{garment_spec.display_name(garment_style)} "
+        f"{garment_spec.display_name(garment_type)}"
+    )
     return {
         "garment": (
-            f"Create a flat, front-facing, full garment product image of a "
-            f"{garment_style} {garment_type}. [image 1] is the fabric/garment "
+            "Create a flat, front-facing, full garment product image of a "
+            f"{name}. {spec} [image 1] is the fabric/garment "
             f"reference image and is the {marker} for the garment appearance. "
             f"Use the described fabric details only as supplementary hints "
             f"({fabric_desc}). Reproduce Image 1's exact original colors, color "
@@ -171,9 +193,8 @@ def garment_prompts(garment_type: str, garment_style: str, analysis: Optional[di
             f"person, no mannequin, no text."
         ),
         "tryon": (
-            f"Dress the person in this photo in a {garment_style} "
-            f"{garment_type} that exactly matches the garment reference image. "
-            f"[image 1] is the person photo - keep their face, hair, pose, skin "
+            f"Dress the person in this photo in a {name}. "
+            f"{spec_tryon} [image 1] is the person photo - keep their face, hair, pose, skin "
             f"tone and body exactly as they are, and only replace their "
             f"clothing. [image 2] is the garment reference image and is the "
             f"{marker} - use only its garment for the clothes, and use the "

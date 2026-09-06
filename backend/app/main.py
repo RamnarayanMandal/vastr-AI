@@ -5,12 +5,38 @@ from contextlib import asynccontextmanager
 import asyncio
 from sqlalchemy import text
 import redis
+from kombu.exceptions import OperationalError as KombuOperationalError
 
 from .config import settings
 from .database import engine
 from .router import auth, credits, history, notifications, try_on, uploads, users
 from .router.uploads import LOCAL_DIR
 from .worker.autostart import ensure_worker_running
+from .worker.celery_app import celery_app as worker_celery_app
+
+
+def _worker_health_check(timeout: float = 1.0, inspector=None) -> dict:
+    """Probe Celery workers via the pidbox broadcast.
+
+    Returns:
+      reachable=True            -> a worker replied to ping
+      reachable=False, broker_ok=True  -> broker reachable, no worker replying
+      reachable=False, broker_ok=False -> broker itself is unavailable
+
+    Unlike scanning Redis keys for ``celery@*``, ping reflects reality: the
+    key scan is unreliable on managed Redis providers (no keys appear even
+    when workers are consuming).
+    """
+    try:
+        insp = inspector or worker_celery_app.control.inspect(timeout=timeout)
+        reply = insp.ping()
+    except (KombuOperationalError, redis.exceptions.ConnectionError, TimeoutError, OSError) as exc:
+        return {"reachable": False, "broker_ok": False, "detail": f"{type(exc).__name__}: {exc}"}
+    except Exception as exc:  # noqa: BLE001 - safest to degrade to "unknown"
+        return {"reachable": False, "broker_ok": False, "detail": f"unexpected: {type(exc).__name__}: {exc}"}
+    if not reply:
+        return {"reachable": False, "broker_ok": True, "detail": "no worker replied"}
+    return {"reachable": True, "broker_ok": True, "workers": sorted(str(k) for k in reply)}
 
 
 @asynccontextmanager
@@ -36,19 +62,27 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         print(f"[REDIS] Connection failed: {type(exc).__name__}", flush=True)
     try:
-        _rb = redis.Redis.from_url(settings.redis_url)
-        _workers = list(_rb.scan_iter("celery@*", count=1000))
-        if not _workers:
-            print(
-                "[WORKER] WARNING: No Celery worker detected - jobs will stay QUEUED. "
-                "Check the autostart log above (or run backend/run_dev.ps1 / the Docker 'worker' service).",
-                flush=True,
-            )
+        if settings.celery_broker_url.startswith("memory://"):
+            # In-memory test/local broker: no separate worker process to probe.
+            print("[WORKER_HEALTH] reachable=false (memory broker, no worker)", flush=True)
         else:
-            names = ", ".join(w.decode("utf-8") for w in _workers)
-            print(f"[WORKER] Detected {len(_workers)} worker(s): {names}", flush=True)
+            result = await asyncio.wait_for(
+                asyncio.to_thread(_worker_health_check), timeout=6.0
+            )
+            if result["reachable"]:
+                print(f"[WORKER_HEALTH] reachable=true workers={result['workers']}", flush=True)
+            elif result["broker_ok"]:
+                print(
+                    "[WORKER_HEALTH] reachable=false workers=0 - broker reachable but no "
+                    "worker replying yet (worker may still be booting)",
+                    flush=True,
+                )
+            else:
+                print(f"[WORKER_HEALTH] broker-unavailable detail={result['detail']}", flush=True)
+    except asyncio.TimeoutError:
+        print("[WORKER_HEALTH] timeout worker=unknown", flush=True)
     except Exception as exc:
-        print(f"[WORKER] Could not check worker presence: {type(exc).__name__}", flush=True)
+        print(f"[WORKER_HEALTH] check failed: {type(exc).__name__}: {exc}", flush=True)
     yield
 
 

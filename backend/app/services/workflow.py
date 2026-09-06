@@ -34,6 +34,7 @@ rebuild (Part 5).
 from __future__ import annotations
 
 import io
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, List, Literal, Optional, TypedDict
@@ -42,6 +43,7 @@ from langgraph.graph import END, START, StateGraph
 
 from ..config import settings
 from .imagekit import download_url, upload_bytes
+from .perf import ago_ms, perf
 from .pipeline import analyze_fabric
 from .prompts import VastrAIPrompts
 
@@ -144,7 +146,17 @@ def node_validate_inputs(state: WorkflowState, comps: WorkflowComponents) -> Wor
 
     downloader = comps.downloader or download_url
     for key, what in (("person_image_url", "customer photo"), ("fabric_image_url", "fabric photo")):
+        dname = "person" if key == "person_image_url" else "fabric"
+        d_t = time.perf_counter()
+        perf("image_download_start", job_id=state.get("job_id"), key=dname)
         data = downloader(state.get(key) or "")
+        perf(
+            "image_download_end",
+            job_id=state.get("job_id"),
+            key=dname,
+            duration_ms=round(ago_ms(d_t), 1),
+            bytes=len(data) if data else 0,
+        )
         if data:
             _require_decodable(data, what)
             state["person_image" if key == "person_image_url" else "fabric_image"] = data
@@ -240,6 +252,14 @@ def _log_generation_request(
         f"prompt_contains_garment_preservation={str(contains_preservation).lower()}",
         flush=True,
     )
+    # Temporary audit (no keys, no image data): which garment type/style reached
+    # the request and whether the hard constraints are in the prompt.
+    props.audit_request(
+        task,
+        state.get("garment_type") or "",
+        state.get("garment_style") or "",
+        reference_attached=garment_visible,
+    )
 
 
 def node_generate_garment(state: WorkflowState, comps: WorkflowComponents) -> WorkflowState:
@@ -253,6 +273,15 @@ def node_generate_garment(state: WorkflowState, comps: WorkflowComponents) -> Wo
         state, provider, "garment", input_count=1, garment_visible=True
     )
     print(f"[AI] Generation request started job_id={job_id} task=garment model={getattr(provider, 'model_tag', '') or getattr(provider, 'model', '')}", flush=True)
+    ai_t = time.perf_counter()
+    perf(
+        "garment_ai_start",
+        job_id=job_id,
+        provider=provider.__class__.__name__,
+        model=getattr(provider, "model_tag", "") or getattr(provider, "model", ""),
+        input_images=1,
+        output_images=getattr(provider, "num_images", 1),
+    )
     try:
         garment = provider.generate_garment(
             fabric,
@@ -262,6 +291,13 @@ def node_generate_garment(state: WorkflowState, comps: WorkflowComponents) -> Wo
         )
     except Exception as exc:  # noqa: BLE001
         raise _map_provider_error(exc, "Garment generation") from exc
+    perf(
+        "garment_ai_end",
+        job_id=job_id,
+        duration_ms=round(ago_ms(ai_t), 1),
+        bytes=len(garment) if garment else 0,
+        model=getattr(provider, "model_used", "") or getattr(provider, "model_tag", ""),
+    )
     if provider.__class__.__name__ == "OpenRouterImageGenBackend":
         _trace(state, "OPENROUTER", f"Response received task=garment bytes={len(garment) if garment else 0}")
     if not garment or len(garment) < 100:
@@ -287,6 +323,15 @@ def node_generate_tryon(state: WorkflowState, comps: WorkflowComponents) -> Work
         state, provider, "tryon", input_count=2, garment_visible=True
     )
     print(f"[AI] Generation request started job_id={job_id} task=tryon model={getattr(provider, 'model_tag', '') or getattr(provider, 'model', '')}", flush=True)
+    ai_t = time.perf_counter()
+    perf(
+        "tryon_ai_start",
+        job_id=job_id,
+        provider=provider.__class__.__name__,
+        model=getattr(provider, "model_tag", "") or getattr(provider, "model", ""),
+        input_images=2,
+        output_images=getattr(provider, "num_images", 1),
+    )
     try:
         result = provider.generate_tryon(
             person,
@@ -297,6 +342,13 @@ def node_generate_tryon(state: WorkflowState, comps: WorkflowComponents) -> Work
         )
     except Exception as exc:  # noqa: BLE001
         raise _map_provider_error(exc, "Virtual try-on") from exc
+    perf(
+        "tryon_ai_end",
+        job_id=job_id,
+        duration_ms=round(ago_ms(ai_t), 1),
+        bytes=len(result) if result else 0,
+        model=getattr(provider, "model_used", "") or getattr(provider, "model_tag", ""),
+    )
     if provider.__class__.__name__ == "OpenRouterImageGenBackend":
         _trace(state, "OPENROUTER", f"Response received task=tryon bytes={len(result) if result else 0}")
     if not result or len(result) < 100:
@@ -312,10 +364,13 @@ def node_generate_tryon(state: WorkflowState, comps: WorkflowComponents) -> Work
 def node_validate_generated(state: WorkflowState, comps: WorkflowComponents) -> WorkflowState:
     _trace(state, "IMAGE", "Validate generated image START")
     data = state.get("generated_image")
+    job_id = state.get("job_id")
     if not data or len(data) < 500:
         raise WorkflowError("Generated result is empty.", retryable=True)
     from PIL import Image
 
+    proc_t = time.perf_counter()
+    perf("image_processing_start", job_id=job_id, kind="quality_gate")
     try:
         im = Image.open(io.BytesIO(data))
         im.load()
@@ -333,13 +388,25 @@ def node_validate_generated(state: WorkflowState, comps: WorkflowComponents) -> 
         raise WorkflowError("Generated result could not be encoded.", retryable=True)
     if len(buf.getvalue()) < 500:
         raise WorkflowError("Generated result is too small to store.", retryable=True)
+    perf(
+        "image_processing_end",
+        job_id=job_id,
+        kind="quality_gate",
+        duration_ms=round(ago_ms(proc_t), 1),
+        width=w,
+        height=h,
+        bytes=len(data),
+    )
 
     threshold = settings.identity_min_score
     if threshold:
         from .pipeline import identity_metrics
 
+        id_t = time.perf_counter()
+        perf("identity_check_start", job_id=job_id)
         score = identity_metrics(state.get("person_image"), data)
         state["identity_score"] = score
+        perf("identity_check_end", job_id=job_id, duration_ms=round(ago_ms(id_t), 1), score=round(score, 3))
         if score < threshold:
             raise WorkflowError(
                 f"Identity preservation failed (score {score:.2f}).", retryable=True
@@ -352,11 +419,21 @@ def node_validate_generated(state: WorkflowState, comps: WorkflowComponents) -> 
 def node_upload_result(state: WorkflowState, comps: WorkflowComponents) -> WorkflowState:
     _trace(state, "IMAGEKIT", "Upload started")
     data = state.get("generated_image")
+    job_id = state.get("job_id")
     if not data:
         raise WorkflowError("No generated image to upload.", retryable=True)
     uploader = comps.uploader or upload_bytes
     name = f"result-{uuid.uuid4().hex[:12]}.jpg"
+    up_t = time.perf_counter()
+    perf("imagekit_upload_start", job_id=job_id, file=name, bytes=len(data))
     uploaded = uploader(data, name, settings.results_folder)
+    perf(
+        "imagekit_upload_end",
+        job_id=job_id,
+        duration_ms=round(ago_ms(up_t), 1),
+        ok=str(uploaded is not None and bool(uploaded.get("url"))).lower(),
+        url=(uploaded or {}).get("url", ""),
+    )
     if uploaded is not None and uploaded.get("url"):
         state["result_url"] = uploaded["url"]
         _log(state, "upload_result", "ok")
@@ -368,11 +445,15 @@ def node_upload_result(state: WorkflowState, comps: WorkflowComponents) -> Workf
 
 
 def node_save_result(state: WorkflowState, comps: WorkflowComponents) -> WorkflowState:
+    job_id = state.get("job_id")
     if comps.saver is None:
         _log(state, "save_result", "ok")
         return state
     try:
+        db_t = time.perf_counter()
+        perf("db_persistence_start", job_id=job_id)
         comps.saver(state)
+        perf("db_persistence_end", job_id=job_id, duration_ms=round(ago_ms(db_t), 1))
         _log(state, "save_result", "ok")
         _trace(state, "DB", "Result saved")
     except Exception as exc:  # noqa: BLE001
@@ -403,10 +484,17 @@ def _make_node(fn, comps: WorkflowComponents):
 
     The ``comps`` collaborator is closed over so LangGraph can call the node with
     just the state argument. Returns a normal LangGraph node (state -> state).
+
+    Also emits per-node [PERF] timing (all nodes run sequentially in this
+    linear graph, so node durations are strictly additive).
     """
 
     def wrapped(state: WorkflowState) -> WorkflowState:
         node_name = getattr(fn, "__name__", fn.__class__.__name__)
+        job_id = state.get("job_id")
+        node_started = time.perf_counter()
+        ok = True
+        perf("node_start", name=node_name, job_id=job_id)
         print(f"[WORKFLOW] >>> {node_name} | job={state.get('job_id')}")
         try:
             fn(state, comps)
@@ -416,12 +504,21 @@ def _make_node(fn, comps: WorkflowComponents):
             _trace(state, "ERROR", f"{node_name}: {exc.message}")
             state["error"] = exc.message
             state["retryable"] = exc.retryable
+            ok = False
         except Exception as exc:  # noqa: BLE001 - unexpected -> transient
             msg = _brief(exc) or "Unexpected workflow failure."
             print(f"[WORKFLOW] !!! {node_name} FAILED ({type(exc).__name__}): {msg}")
             _trace(state, "ERROR", f"{node_name}: {msg}")
             state["error"] = msg
             state["retryable"] = True
+            ok = False
+        perf(
+            "node_end",
+            name=node_name,
+            job_id=job_id,
+            duration_ms=round(ago_ms(node_started), 1),
+            ok=str(ok).lower(),
+        )
         state.setdefault("retries", 0)
         return state
 
@@ -544,8 +641,16 @@ def run_workflow(
     )
     print(f"[WORKFLOW] run_workflow start | job={job_id} | provider_type={type(provider).__name__}")
     print(f"[TRYON][job_id={job_id}][GRAPH] Workflow started", flush=True)
+    perf("langgraph_start", job_id=job_id)
+    graph_t = time.perf_counter()
     graph = build_workflow_graph(components=comps, max_retries=max_retries)
     result = graph.invoke(graph_state)
+    perf(
+        "langgraph_end",
+        job_id=job_id,
+        graph_duration_ms=round(ago_ms(graph_t), 1),
+        status=result.get("status"),
+    )
     print(f"[WORKFLOW] run_workflow done | job={job_id} | status={result.get('status')} | error={result.get('error')}")
     print(f"[TRYON][job_id={job_id}][JOB] {result.get('status')}", flush=True)
     return result

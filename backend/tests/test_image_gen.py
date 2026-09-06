@@ -40,6 +40,140 @@ def test_prompt_builders_are_distinct():
     assert "shirt" in garment.lower() and "fabric" in garment.lower()
 
 
+# --- Garment-type + style accuracy (hard constraints) -----------------------
+
+def test_blouse_boat_neck_prompt_is_hard_constrained():
+    """TEST 1: blouse + boat neck -> recognizable boat-neck blouse, not a tee."""
+    prompt = build_tryon_prompt("blouse", "boat_neck", None).lower()
+    assert "boat neck blouse" in prompt
+    assert "blouse silhouette" in prompt or "feminine blouse" in prompt
+    assert "boat neckline" in prompt or "boat neck" in prompt
+    # style must not replace the category
+    assert "remain a blouse" in prompt
+    assert "never change the garment category" in prompt
+    # negative constraints for a generic top
+    assert "generic t-shirt" in prompt or "t-shirt" in prompt
+    assert "tunic" in prompt and "oversized top" in prompt
+
+
+def test_blouse_round_neck_prompt():
+    """TEST 2: blouse + round neck -> blouse with a ROUND neckline."""
+    prompt = build_tryon_prompt("blouse", "round_neck", None).lower()
+    assert "round crew neckline" in prompt or "round neckline" in prompt
+    assert "blouse" in prompt
+    # round neck must not degrade into a boat/V/sweetheart neck
+    assert "keep it as the garment's neckline" in prompt
+
+
+def test_shirt_formal_prompt_stays_a_shirt():
+    """TEST 3: shirt + formal -> clearly a shirt, not a blouse/top."""
+    prompt = build_garment_prompt("shirt", "formal", None).lower()
+    assert "button-down shirt" in prompt and "collar" in prompt
+    assert "never a blouse, top or knit" in prompt or "blouse" in prompt
+    assert "remain a shirt" in prompt
+
+
+def test_t_shirt_prompt_stays_a_t_shirt():
+    """TEST 4: t-shirt + casual -> clearly a T-shirt (crew neck, no tailoring)."""
+    prompt = build_garment_prompt("t_shirt", "casual", None).lower()
+    assert "t-shirt" in prompt or "t shirt" in prompt
+    assert "crew-neck round collar" in prompt or "crew" in prompt
+    assert "blouse" not in prompt.split("explicitly avoid")[0]
+
+
+def test_checkered_fabric_preservation_with_blouse_constraint():
+    """TEST 5: blouse + boat neck + checkered fabric keeps both constraints
+    (recognizable boat-neck blouse AND checkered pattern preservation text)."""
+    analysis = {
+        "dominant_hex": "#c0392b",
+        "palette": ["#c0392b", "#f1c40f"],
+        "has_pattern": True,
+        "brightness": 0.5,
+    }
+    from app.services.prompts import VastrAIPrompts
+    prompt = build_tryon_prompt("blouse", "boat_neck", analysis)
+    low = prompt.lower()
+    assert "checkered" in low or "checks or checkered patterns" in low
+    assert VastrAIPrompts.PRESERVATION_MARKER in prompt
+    assert "boat neck" in low and "blouse silhouette" in low
+    # the fabric description text must still reach the prompt
+    assert "dominant colour #c0392b" in low or "dominant color #c0392b" in low
+
+
+def test_prompt_constraint_flags(capsys):
+    """Audit helper reports type/style constraint flags + runtime fields."""
+    from app.services.prompts import VastrAIPrompts
+
+    flags = VastrAIPrompts.constraint_flags("blouse", "boat_neck")
+    assert flags == {"garment_type_constraint": True, "style_constraint": True}
+
+    VastrAIPrompts.audit_request("tryon", "blouse", "boat_neck", True)
+    out = capsys.readouterr().out
+    assert "[TRYON][GARMENT]" in out and "type=blouse" in out
+    assert "style=boat_neck" in out and "reference_attached=true" in out
+    assert "[TRYON][PROMPT]" in out
+    assert "garment_type_constraint=true" in out and "style_constraint=true" in out
+
+
+def test_blouse_designer_prompt_never_a_shirt_kurta_tunic():
+    """Bug fix: blouse + designer must stay a blouse, never shirt/kurta/tunic."""
+    from app.services.image_gen import build_tryon_prompt
+    from app.services.garment_spec import garment_negative_constraint
+
+    prompt = build_tryon_prompt("blouse", "designer", None).lower()
+    # feminine blouse remains the hard constraint
+    assert "feminine blouse construction" in prompt or "blouse silhouette" in prompt
+    assert "remain a blouse" in prompt
+    assert "must never override, replace, re-categorise or genericize it" in prompt
+    # designer stays a modifier on the blouse, not a category change
+    assert "designer" in prompt and "designer-level detailing" in prompt
+    # explicit antis: no shirt/kurta/ethnic/tunic/mandarin/stand collar
+    neg = garment_negative_constraint("blouse", "designer")
+    assert "kurta" in neg and "kurti" in neg and "ethnic straight-cut top" in neg
+    assert "mandarin collar" in neg and "stand collar" in neg
+    assert "shirt collar" in neg and "men's button-down shirt" in neg
+    # the same antis must actually reach the full try-on prompt
+    for term in (
+        "kurta", "kurti", "mandarin collar", "stand collar",
+        "men's button-down shirt", "tunic",
+    ):
+        assert term in prompt
+
+
+def test_garment_negative_constraint_designer_only_reinforces_own_type():
+    """Designer adds a small dev-negative reinforcement on top of the type's
+    own (already strengthened) antis; unrelated types stay clean."""
+    from app.services.garment_spec import garment_negative_constraint
+
+    # blouse + designer: full antis include shirt/kurta/tunic/mandarin collar
+    blouse_designer = garment_negative_constraint("blouse", "designer")
+    assert "kurta" in blouse_designer and "stand collar" in blouse_designer
+    assert "men's button-down shirt" in blouse_designer
+    # blouse (any style) already forbids kurta/stand collar via its type spec
+    boat = garment_negative_constraint("blouse", "boat_neck")
+    assert "kurta" in boat and "stand collar" in boat
+    assert "generic top" in boat and "tunic" in boat
+    # t-shirt + designer keeps ITS OWN antis - never blouse tailoring terms
+    tshirt_designer = garment_negative_constraint("t_shirt", "designer")
+    assert "men's button-down shirt" not in tshirt_designer
+    assert "shirt collar" not in tshirt_designer
+
+
+def test_t_shirt_designer_stays_a_t_shirt():
+    """Blouse-specific antis never leak into an unrelated type, even designer."""
+    from app.services.image_gen import build_garment_prompt
+    from app.services.garment_spec import garment_negative_constraint
+
+    prompt = build_garment_prompt("t_shirt", "designer", None).lower()
+    assert "t-shirt" in prompt or "t shirt" in prompt
+    # t-shirt keeps its OWN correct negatives (a tee must not become a blouse)
+    neg = garment_negative_constraint("t_shirt", "designer")
+    assert "blouse" in neg  # from t_shirt's own spec - correct
+    # dev-only designer reinforcement never injects blouse-unrelated tailors
+    assert "men's button-down shirt" not in neg  # t-shirt superset keeps it clean
+    assert "shirt collar" not in neg
+
+
 def test_get_backend_by_name():
     assert isinstance(get_image_gen_backend("gemini"), GeminiImageGenBackend)
     assert isinstance(get_image_gen_backend("flux"), FluxImageGenBackend)

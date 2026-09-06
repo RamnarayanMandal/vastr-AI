@@ -514,6 +514,12 @@ class ImageGenGarmentConstructionStage(GarmentConstructionStage):
             f"{str(VastrAIPrompts.PRESERVATION_MARKER in prompt).lower()}",
             flush=True,
         )
+        VastrAIPrompts.audit_request(
+            "garment",
+            ctx.input_.garment_type,
+            ctx.input_.garment_style,
+            reference_attached=True,
+        )
         try:
             data = self.backend.generate_garment(
                 ctx.fabric_bytes,
@@ -572,6 +578,12 @@ class ImageGenVirtualTryOnStage(VirtualTryOnStage):
             f"prompt_contains_garment_preservation="
             f"{str(VastrAIPrompts.PRESERVATION_MARKER in prompt).lower()}",
             flush=True,
+        )
+        VastrAIPrompts.audit_request(
+            "tryon",
+            ctx.input_.garment_type,
+            ctx.input_.garment_style,
+            reference_attached=True,
         )
         try:
             data = self.backend.generate_tryon(
