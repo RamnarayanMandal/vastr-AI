@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
+import asyncio
 from sqlalchemy import text
 import redis
 
@@ -9,19 +10,20 @@ from .config import settings
 from .database import engine
 from .router import auth, credits, history, notifications, try_on, uploads, users
 from .router.uploads import LOCAL_DIR
+from .worker.autostart import ensure_worker_running
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # The Celery worker is started explicitly by the development script
-    # (backend/run_dev.ps1) or by the dedicated Docker `worker` service.
-    # We intentionally do NOT spawn a worker from inside the web server:
-    # auto-spawning a detached background subprocess from the API process is
-    # what caused "many terminals/processes" during development, and under
-    # `uvicorn --reload` (a parent + reload child) it would double-spawn.
-    # Keeping the worker a separate, explicitly-started process yields ONE
-    # clean API server and exactly ONE worker.
+    # Auto-start the Celery worker so a plain `uvicorn app.main:app --reload`
+    # also brings up the worker alongside the API. app/worker/autostart.py uses
+    # a PID lock file, so under `--reload` (parent + reload child) it spawns
+    # exactly ONE worker. Disable the autostart with: VASTRAVIEW_NO_AUTOSTART=1
     print("[API] Uvicorn started", flush=True)
+    try:
+        await asyncio.to_thread(ensure_worker_running)
+    except Exception as exc:
+        print(f"[WORKER] Autostart failed: {type(exc).__name__}: {exc}", flush=True)
     try:
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
@@ -39,7 +41,7 @@ async def lifespan(app: FastAPI):
         if not _workers:
             print(
                 "[WORKER] WARNING: No Celery worker detected - jobs will stay QUEUED. "
-                "Start the worker via backend/run_dev.ps1 (or the Docker 'worker' service).",
+                "Check the autostart log above (or run backend/run_dev.ps1 / the Docker 'worker' service).",
                 flush=True,
             )
         else:

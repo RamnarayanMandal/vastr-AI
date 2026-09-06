@@ -1,0 +1,2 @@
+29604
+D:\project\VastraView\backend\.venv\Scripts\python.exe -m celery -A app.worker.celery_app worker -l info -Q vastrai.tryon --concurrency 1 --pool solo

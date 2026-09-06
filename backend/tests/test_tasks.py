@@ -11,7 +11,6 @@ from app.services.try_on_provider import CatVTONProvider, MockVirtualTryOnProvid
 from app.worker import tasks
 from app.worker.tasks import _backoff, _claim_job, _fail, _process_job
 from app.main import lifespan
-import app.main as main_module
 
 
 def _seed_assets(db, user_id) -> dict:
@@ -69,24 +68,26 @@ def test_claim_job_idempotent(db_session, sample_user):
     assert job.status == "PROCESSING"
 
 
-def test_api_lifespan_detects_worker_but_does_not_spawn_one():
-    """The worker is an explicit external process (see backend/run_dev.ps1);
-    lifespan must never auto-spawn a detached subprocess from the API."""
+def test_api_lifespan_autostarts_worker():
+    """Uvicorn boot must call ensure_worker_running() so a plain
+    `uvicorn app.main:app --reload` also spawns the Celery worker."""
     mock_connect = MagicMock()
     mock_connect.__enter__.return_value = object()
     mock_connect.__exit__.return_value = None
 
-    assert not hasattr(main_module, "ensure_worker_running")
-
     with patch("app.main.engine.connect", return_value=mock_connect), patch(
         "app.main.redis.Redis.from_url"
-    ) as redis_mock:
+    ) as redis_mock, patch(
+        "app.main.ensure_worker_running", return_value=True
+    ) as autostart_mock:
         redis_mock.return_value.ping.return_value = True
         redis_mock.return_value.scan_iter.return_value = [b"celery@vastrai-worker"]
         async def _run():
             async with lifespan(object()):
                 pass
         asyncio.run(_run())
+
+    autostart_mock.assert_called_once()
 
 
 def test_process_job_completes(db_session, sample_user):
